@@ -1,0 +1,6 @@
+[submodule "components/mediamtx-playground"]
+	path = components/mediamtx-playground
+	url = https://github.com/ishiishikou/mediamtx-playground.git
+[submodule "components/realtime-pose-triton"]
+	path = components/realtime-pose-triton
+	url = https://github.com/ishiishikou/realtime-pose-triton.git
