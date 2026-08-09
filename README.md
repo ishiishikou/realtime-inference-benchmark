@@ -11,10 +11,10 @@ WebRTC / RTSP の映像配信と Triton 推論を組み合わせた、リアル�
   - 参照コミット: `7f68a216c846eb8844c0a39bf9cb1545e88feddf`
 - `realtime-pose-triton`
   - WebRTC 入力、RTMPose / Triton 推論、推論結果返却
-  - 現在は作成中の PR #12 (`agent/cpu-vlm-sample`) の head を参照
-  - 参照コミット: `47a8c8c1f53423b611a16c5243ade8586bf56d3e`
+  - `main` の参照コミット: `48be43377e459fb037797f59820a9cb05c47a266`
+  - PR #12 で追加された CPU-only SmolVLM サンプルも同コミットに含まれますが、本ハーネスの主要測定対象は既存のリアルタイム姿勢推定経路です。
 
-`realtime-pose-triton` PR #12 が更新された場合は、測定前に submodule の参照コミットも意図的に更新してください。PR が squash merge された場合、最終的には merge 後の `main` のコミットへ固定し直します。
+測定結果の再現性を保つため、submodule はブランチ名ではなくコミット SHA に固定します。元リポジトリを更新した場合は、測定条件を確認したうえで参照コミットを意図的に更新してください。
 
 ## 測定対象
 
