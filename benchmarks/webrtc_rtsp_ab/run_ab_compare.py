@@ -79,6 +79,19 @@ def marker(d)->dict[str,Any]|None:
     return r if isinstance(r,dict) and "id" in r else None
 
 
+def publisher_clock(d,fps:int,mod:int)->dict[str,Any]|None:
+    try:
+        r=d.execute_script("const v=document.querySelector('video'); return v && v.readyState>=2 && v.videoWidth ? {currentTime:v.currentTime,width:v.videoWidth,height:v.videoHeight,paused:v.paused} : null;")
+    except Exception:
+        return None
+    if not isinstance(r,dict) or r.get("paused"):
+        return None
+    ct=float(r.get("currentTime") or 0.0)
+    # Fake-camera Y4M is CFR. Use the media clock as the publisher-side live-edge reference
+    # instead of requiring canvas extraction from the local preview.
+    return {"id":int(round(ct*fps))%mod,"currentTime":ct,"width":int(r["width"]),"height":int(r["height"])}
+
+
 def wait_path(name:str,timeout=12):
     end=time.monotonic()+timeout; last=""
     while time.monotonic()<end:
@@ -108,11 +121,13 @@ def start_publisher(d,base,w,h,fps):
     wait_path("benchmark/live")
     end=time.monotonic()+8; last_meta=None
     while time.monotonic()<end:
-        if marker(d):return
-        try:last_meta=d.execute_script("const v=document.querySelector('video'); return v ? {readyState:v.readyState,width:v.videoWidth,height:v.videoHeight,currentTime:v.currentTime,paused:v.paused} : null;")
+        try:
+            last_meta=d.execute_script("const v=document.querySelector('video'); return v ? {readyState:v.readyState,width:v.videoWidth,height:v.videoHeight,currentTime:v.currentTime,paused:v.paused} : null;")
+            if isinstance(last_meta,dict) and last_meta.get("readyState",0)>=2 and last_meta.get("width",0)>0 and not last_meta.get("paused") and float(last_meta.get("currentTime",0))>0.2:
+                return
         except Exception:pass
         time.sleep(.1)
-    raise RuntimeError(f"publisher marker not visible; video={last_meta}")
+    raise RuntimeError(f"publisher video not running; video={last_meta}")
 
 
 def uniq(xs:list[Ev])->list[Ev]:
@@ -168,8 +183,8 @@ def run_once(n,pub,rd,w,h,fps,mod,duration,outdir):
     t0a=f.t0;t0b=time.monotonic();rd.get("http://127.0.0.1:8889/benchmark/live?controls=false&muted=true&autoplay=true")
     src=[];we=[];fe=[];ls=lw=None;end=time.monotonic()+duration
     while time.monotonic()<end:
-        now=time.monotonic();s=marker(pub)
-        if s and s["id"]!=ls:src.append(Ev(now,int(s["id"]),"publisher",float(s["currentTime"])));ls=int(s["id"])
+        now=time.monotonic();s=publisher_clock(pub,fps,mod)
+        if s and s["id"]!=ls:src.append(Ev(now,int(s["id"]),"publisher_clock",float(s["currentTime"])));ls=int(s["id"])
         now=time.monotonic();r=marker(rd)
         if r and r["id"]!=lw:we.append(Ev(now,int(r["id"]),"webrtc_whep",float(r["currentTime"])));lw=int(r["id"])
         drain(q,fe);time.sleep(.035)
@@ -202,6 +217,6 @@ def main():
         for d in [rd,pub]:
             try:d.quit()
             except Exception:pass
-    s={"source":{"width":x.width,"height":x.height,"fps":x.source_fps,"marker_modulus":x.modulus},"paths":{"A":"Browser WebRTC -> MediaMTX -> RTSP -> FFmpeg(fps=2)","B":"Browser WebRTC -> MediaMTX -> WebRTC/WHEP -> Chrome decoder -> logical 2fps"},"repeats":rs,"aggregate":aggregate(rs)};(x.output_dir/"summary.json").write_text(json.dumps(s,indent=2),encoding="utf-8");print(json.dumps(s["aggregate"],indent=2));return 0 if s["aggregate"]["all_repeats_valid"] else 2
+    s={"source":{"width":x.width,"height":x.height,"fps":x.source_fps,"marker_modulus":x.modulus,"live_edge_reference":"publisher video.currentTime * source_fps"},"paths":{"A":"Browser WebRTC -> MediaMTX -> RTSP -> FFmpeg(fps=2)","B":"Browser WebRTC -> MediaMTX -> WebRTC/WHEP -> Chrome decoder -> logical 2fps"},"repeats":rs,"aggregate":aggregate(rs)};(x.output_dir/"summary.json").write_text(json.dumps(s,indent=2),encoding="utf-8");print(json.dumps(s["aggregate"],indent=2));return 0 if s["aggregate"]["all_repeats_valid"] else 2
 
 if __name__=="__main__":sys.exit(main())
