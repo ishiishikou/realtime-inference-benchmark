@@ -1,0 +1,18 @@
+logLevel: info
+
+api: yes
+apiAddress: :9997
+
+rtsp: yes
+rtspAddress: :8554
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcAdditionalHosts: [127.0.0.1]
+
+pathDefaults:
+  source: publisher
+
+paths:
+  all_others:

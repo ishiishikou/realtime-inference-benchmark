@@ -1,0 +1,156 @@
+name: WebRTC vs RTSP startup comparison
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/webrtc-rtsp-ab.yml"
+      - "benchmarks/webrtc_rtsp_ab/**"
+      - "docs/webrtc-rtsp-ab.md"
+  workflow_dispatch:
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      MTX_IMAGE: bluenviron/mediamtx:1.20.1
+      RESULT_DIR: results/webrtc-rtsp-ab
+      FAKE_VIDEO: /tmp/webrtc-rtsp-ab-source.y4m
+      GST_PLUGIN_RS_TAG: 0.12.7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg and GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-nice \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            pkg-config
+
+      - name: Build pinned GStreamer WHEP plugin
+        run: |
+          rm -rf /tmp/gst-plugins-rs
+          git clone --depth 1 --branch "$GST_PLUGIN_RS_TAG" \
+            https://github.com/GStreamer/gst-plugins-rs.git /tmp/gst-plugins-rs
+          cargo build \
+            --manifest-path /tmp/gst-plugins-rs/Cargo.toml \
+            -p gst-plugin-webrtchttp \
+            --release
+          echo "GST_PLUGIN_PATH=/tmp/gst-plugins-rs/target/release" >> "$GITHUB_ENV"
+          GST_PLUGIN_PATH=/tmp/gst-plugins-rs/target/release gst-inspect-1.0 whepsrc
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check "selenium==4.35.0"
+
+      - name: Record tool versions
+        run: |
+          ffmpeg -version | head -n 1
+          gst-launch-1.0 --version | head -n 2
+          gst-inspect-1.0 whepsrc | head -n 25
+          rustc --version
+          cargo --version
+          (google-chrome --version || google-chrome-stable --version || true)
+          chromedriver --version || true
+          docker --version
+          python --version
+
+      - name: Generate validated FullHD 15fps marked source
+        run: |
+          python benchmarks/webrtc_rtsp_ab/generate_marker_y4m.py \
+            --output "$FAKE_VIDEO" \
+            --width 1080 \
+            --height 1920 \
+            --fps 15 \
+            --frames 300
+
+      - name: Start MediaMTX
+        run: |
+          docker pull "$MTX_IMAGE"
+          docker run -d --name mediamtx-ab --network host \
+            -v "$PWD/benchmarks/webrtc_rtsp_ab/mediamtx.yml:/mediamtx.yml:ro" \
+            "$MTX_IMAGE"
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9997/v3/paths/list >/tmp/paths.json; then
+              cat /tmp/paths.json
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs mediamtx-ab || true
+          exit 1
+
+      - name: Run RTSP+FFmpeg vs Chrome WebRTC comparison
+        continue-on-error: true
+        run: |
+          mkdir -p "$RESULT_DIR"
+          python benchmarks/webrtc_rtsp_ab/run_ab_compare.py \
+            --fake-video "$FAKE_VIDEO" \
+            --output-dir "$RESULT_DIR" \
+            --repeats 3 \
+            --duration 8 \
+            --width 1080 \
+            --height 1920 \
+            --source-fps 15 \
+            --modulus 300
+
+      - name: Run GStreamer WHEP comparison
+        run: |
+          python benchmarks/webrtc_rtsp_ab/run_gstreamer_compare.py \
+            --fake-video "$FAKE_VIDEO" \
+            --output-dir "$RESULT_DIR" \
+            --repeats 3 \
+            --duration 8 \
+            --width 1080 \
+            --height 1920 \
+            --source-fps 15 \
+            --modulus 300
+
+      - name: Show summaries
+        if: always()
+        run: |
+          if [ -f "$RESULT_DIR/summary.json" ]; then
+            echo "===== FFmpeg vs Chrome ====="
+            cat "$RESULT_DIR/summary.json"
+          fi
+          if [ -f "$RESULT_DIR/gstreamer_summary.json" ]; then
+            echo "===== GStreamer WHEP ====="
+            cat "$RESULT_DIR/gstreamer_summary.json"
+          fi
+
+      - name: Capture MediaMTX logs
+        if: always()
+        run: |
+          mkdir -p "$RESULT_DIR"
+          docker logs mediamtx-ab >"$RESULT_DIR/mediamtx.log" 2>&1 || true
+
+      - name: Upload comparison artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-rtsp-ab-${{ github.run_id }}
+          path: results/webrtc-rtsp-ab
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f mediamtx-ab || true

@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Commercial A/B publisher</title></head>
+<body>
+<script>
+const params = new URLSearchParams(location.search);
+const FPS = Number(params.get('fps') ?? '15');
+const PATH_NAME = params.get('path') ?? 'benchmark/live';
+const WHIP_URL = `http://127.0.0.1:8889/${PATH_NAME}/whip`;
+const DURATION_MS = Number(params.get('durationMs') ?? '60000');
+
+window.__probe = {
+  width: 1080,
+  height: 1920,
+  fps: FPS,
+  durationMs: DURATION_MS,
+  path: PATH_NAME,
+  done: false,
+  error: null,
+  outboundVideoStats: [],
+};
+
+function waitFor(predicate, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const started = performance.now();
+    const poll = () => {
+      if (predicate()) return resolve();
+      if (performance.now() - started >= timeoutMs) return reject(new Error(`timeout waiting for ${label}`));
+      setTimeout(poll, 10);
+    };
+    poll();
+  });
+}
+
+async function main() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: {
+      width: {exact: 1080},
+      height: {exact: 1920},
+      frameRate: {ideal: FPS, max: FPS},
+    },
+  });
+  const track = stream.getVideoTracks()[0];
+  track.contentHint = 'motion';
+  window.__probe.trackSettings = track.getSettings();
+
+  const pc = new RTCPeerConnection({});
+  const sender = pc.addTrack(track, stream);
+  const transceiver = pc.getTransceivers().find(t => t.sender === sender);
+  transceiver.direction = 'sendonly';
+
+  const caps = RTCRtpSender.getCapabilities('video');
+  const h264 = (caps?.codecs ?? []).filter(c => c.mimeType.toLowerCase() === 'video/h264');
+  if (!h264.length) throw new Error('Chrome has no H264 sender codec');
+  transceiver.setCodecPreferences(h264);
+
+  const senderParams = sender.getParameters();
+  const tune = e => ({...e, maxFramerate: FPS, maxBitrate: 12_000_000, scaleResolutionDownBy: 1});
+  senderParams.encodings = senderParams.encodings?.length ? senderParams.encodings.map(tune) : [tune({})];
+  senderParams.degradationPreference = 'maintain-resolution';
+  await sender.setParameters(senderParams);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(resolve => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const timeout = setTimeout(resolve, 3000);
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') { clearTimeout(timeout); resolve(); }
+    });
+  });
+
+  const response = await fetch(WHIP_URL, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/sdp'},
+    body: pc.localDescription.sdp,
+  });
+  if (!response.ok) throw new Error(`WHIP failed ${response.status}: ${await response.text()}`);
+  await pc.setRemoteDescription({type: 'answer', sdp: await response.text()});
+  await waitFor(() => pc.connectionState === 'connected', 5000, 'peer connected');
+  window.__probe.connectionEstablishedAtEpochMs = performance.timeOrigin + performance.now();
+  window.__probe.connectionState = pc.connectionState;
+
+  await new Promise(r => setTimeout(r, DURATION_MS));
+  const stats = await sender.getStats();
+  window.__probe.outboundVideoStats = Array.from(stats.values())
+    .filter(r => r.type === 'outbound-rtp' && r.kind === 'video')
+    .map(r => ({ssrc:r.ssrc ?? null, framesEncoded:r.framesEncoded ?? null, framesSent:r.framesSent ?? null,
+      frameWidth:r.frameWidth ?? null, frameHeight:r.frameHeight ?? null, keyFramesEncoded:r.keyFramesEncoded ?? null,
+      bytesSent:r.bytesSent ?? null, targetBitrate:r.targetBitrate ?? null}));
+  window.__probe.done = true;
+  stream.getTracks().forEach(t => t.stop());
+  pc.close();
+}
+
+main().catch(err => {
+  window.__probe.error = String(err?.stack ?? err);
+  window.__probe.done = true;
+});
+</script>
+</body>
+</html>
