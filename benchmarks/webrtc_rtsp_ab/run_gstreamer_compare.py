@@ -23,7 +23,6 @@ from run_ab_compare import (
     read_exact,
     ref_quality,
     uniq,
-    video_meta,
     wait_marker,
     wait_path,
     wait_probe,
@@ -61,7 +60,10 @@ class GStreamerReceiver(threading.Thread):
             "!",
             "videoscale",
             "!",
-            f"video/x-raw,format=BGR,width={width},height={height}",
+            "videorate",
+            "drop-only=true",
+            "!",
+            f"video/x-raw,format=BGR,width={width},height={height},framerate=2/1",
             "!",
             "fdsink",
             "fd=1",
@@ -95,7 +97,7 @@ class GStreamerReceiver(threading.Thread):
             if frame_id is None:
                 self.failures += 1
             else:
-                self.outq.put(Ev(time.monotonic(), frame_id, "webrtc_gstreamer"))
+                self.outq.put(Ev(time.monotonic(), frame_id, "webrtc_gstreamer_2fps"))
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -166,13 +168,13 @@ def run_once(
         "marker_failures": ref_failures,
     }
     result = metrics(
-        "webrtc_gstreamer",
+        "webrtc_gstreamer_2fps",
         receiver.t0,
         frames,
         refs,
         modulus,
         fps,
-        False,
+        True,
         receiver.failures,
     )
     measurement_valid = reference["usable"] and len(uniq(frames)) > 0
@@ -329,8 +331,8 @@ def main() -> int:
             "marker": "validated 16 blocks: sync 1010 + 12-bit sourceFrameId",
         },
         "path": (
-            "Browser WHIP -> MediaMTX -> WebRTC/WHEP -> "
-            "GStreamer whepsrc -> rtph264depay -> avdec_h264 -> logical 2fps"
+            "Browser WHIP -> MediaMTX -> WebRTC/WHEP -> GStreamer whepsrc -> "
+            "rtph264depay -> avdec_h264 -> videorate 2fps"
         ),
         "live_edge_reference": "steady-state Chrome WHEP reader using the same physical sourceFrameId",
         "repeats": results,
