@@ -1,4 +1,4 @@
-name: WebRTC vs RTSP startup A/B
+name: WebRTC vs RTSP startup comparison
 
 on:
   pull_request:
@@ -11,11 +11,12 @@ on:
 jobs:
   compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       MTX_IMAGE: bluenviron/mediamtx:1.20.1
       RESULT_DIR: results/webrtc-rtsp-ab
       FAKE_VIDEO: /tmp/webrtc-rtsp-ab-source.y4m
+      GST_PLUGIN_RS_TAG: 0.12.7
 
     steps:
       - name: Checkout
@@ -26,10 +27,34 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install FFmpeg
+      - name: Install FFmpeg and GStreamer
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y \
+            ffmpeg \
+            gstreamer1.0-tools \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-nice \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            pkg-config
+
+      - name: Build pinned GStreamer WHEP plugin
+        run: |
+          rm -rf /tmp/gst-plugins-rs
+          git clone --depth 1 --branch "$GST_PLUGIN_RS_TAG" \
+            https://github.com/GStreamer/gst-plugins-rs.git /tmp/gst-plugins-rs
+          cargo build \
+            --manifest-path /tmp/gst-plugins-rs/Cargo.toml \
+            -p gst-plugin-webrtchttp \
+            --release
+          echo "GST_PLUGIN_PATH=/tmp/gst-plugins-rs/target/release" >> "$GITHUB_ENV"
+          GST_PLUGIN_PATH=/tmp/gst-plugins-rs/target/release gst-inspect-1.0 whepsrc
 
       - name: Install Python dependencies
         run: python -m pip install --disable-pip-version-check "selenium==4.35.0"
@@ -37,6 +62,10 @@ jobs:
       - name: Record tool versions
         run: |
           ffmpeg -version | head -n 1
+          gst-launch-1.0 --version | head -n 2
+          gst-inspect-1.0 whepsrc | head -n 25
+          rustc --version
+          cargo --version
           (google-chrome --version || google-chrome-stable --version || true)
           chromedriver --version || true
           docker --version
@@ -69,7 +98,8 @@ jobs:
           docker logs mediamtx-ab || true
           exit 1
 
-      - name: Run RTSP+FFmpeg vs WebRTC/WHEP comparison
+      - name: Run RTSP+FFmpeg vs Chrome WebRTC comparison
+        continue-on-error: true
         run: |
           mkdir -p "$RESULT_DIR"
           python benchmarks/webrtc_rtsp_ab/run_ab_compare.py \
@@ -82,11 +112,28 @@ jobs:
             --source-fps 15 \
             --modulus 300
 
-      - name: Show summary
+      - name: Run GStreamer WHEP comparison
+        run: |
+          python benchmarks/webrtc_rtsp_ab/run_gstreamer_compare.py \
+            --fake-video "$FAKE_VIDEO" \
+            --output-dir "$RESULT_DIR" \
+            --repeats 3 \
+            --duration 8 \
+            --width 1080 \
+            --height 1920 \
+            --source-fps 15 \
+            --modulus 300
+
+      - name: Show summaries
         if: always()
         run: |
           if [ -f "$RESULT_DIR/summary.json" ]; then
+            echo "===== FFmpeg vs Chrome ====="
             cat "$RESULT_DIR/summary.json"
+          fi
+          if [ -f "$RESULT_DIR/gstreamer_summary.json" ]; then
+            echo "===== GStreamer WHEP ====="
+            cat "$RESULT_DIR/gstreamer_summary.json"
           fi
 
       - name: Capture MediaMTX logs
