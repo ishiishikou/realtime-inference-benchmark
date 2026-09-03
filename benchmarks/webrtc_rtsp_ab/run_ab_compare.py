@@ -19,7 +19,8 @@ MARKER_JS = f"""
 (() => {{
  const v=document.querySelector('video'); if(!v||v.readyState<2||!v.videoWidth)return null;
  if(!window.__bc){{window.__bc=document.createElement('canvas');__bc.width={CROP_W};__bc.height={CROP_H};window.__bx=__bc.getContext('2d',{{willReadFrequently:true}});}}
- __bx.drawImage(v,0,0,__bc.width,__bc.height,0,0,__bc.width,__bc.height); const d=__bx.getImageData(0,0,__bc.width,__bc.height).data; let m=0;
+ const sw=__bc.width*(v.videoWidth/1920), sh=__bc.height*(v.videoHeight/1080);
+ __bx.drawImage(v,0,0,sw,sh,0,0,__bc.width,__bc.height); const d=__bx.getImageData(0,0,__bc.width,__bc.height).data; let m=0;
  for(let b=0;b<{BITS};b++){{const x={X0}+b*({BLOCK}+{GAP})+{BLOCK//2},y={Y0}+{BLOCK//2};let s=0,n=0;for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){{const o=((y+dy)*__bc.width+x+dx)*4;s+=(d[o]+d[o+1]+d[o+2])/3;n++;}}if(s/n>128)m|=(1<<b);}}
  const lo=m&255, inv=(m>>>8)&255; if(inv!==((~lo)&255))return null; return {{id:lo,currentTime:v.currentTime,width:v.videoWidth,height:v.videoHeight}};
 }})()
@@ -105,11 +106,13 @@ def start_publisher(d,base,w,h,fps):
         except Exception:time.sleep(.2)
     else:raise RuntimeError("publisher UI not ready")
     wait_path("benchmark/live")
-    end=time.monotonic()+8
+    end=time.monotonic()+8; last_meta=None
     while time.monotonic()<end:
         if marker(d):return
+        try:last_meta=d.execute_script("const v=document.querySelector('video'); return v ? {readyState:v.readyState,width:v.videoWidth,height:v.videoHeight,currentTime:v.currentTime,paused:v.paused} : null;")
+        except Exception:pass
         time.sleep(.1)
-    raise RuntimeError("publisher marker not visible")
+    raise RuntimeError(f"publisher marker not visible; video={last_meta}")
 
 
 def uniq(xs:list[Ev])->list[Ev]:
