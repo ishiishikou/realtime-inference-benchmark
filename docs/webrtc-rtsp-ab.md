@@ -2,100 +2,110 @@
 
 ## 目的
 
-推論クライアントの映像受信方式について、同じ映像を使って次の 2 経路を比較します。
+推論クライアントの映像受信方式について、同じ物理フレームを使って次の2経路を比較します。
 
 ```text
 A. 現行相当
-Browser --WebRTC--> MediaMTX --RTSP--> FFmpeg --2fps--> 推論相当処理
+Browser --WHIP/WebRTC--> MediaMTX --RTSP--> FFmpeg --2fps--> 推論相当処理
 
 B. 比較候補
-Browser --WebRTC--> MediaMTX --WebRTC/WHEP--> WebRTC Receiver --2fps--> 推論相当処理
+Browser --WHIP/WebRTC--> MediaMTX --WHEP/WebRTC--> WebRTC Receiver --logical 2fps--> 推論相当処理
 ```
 
-この検証では MediaMTX 自体は外しません。推論クライアント側の `RTSP + FFmpeg` を WebRTC 受信へ置き換えた場合に、FFmpeg の probe に伴う接続待ちや古いフレームの滞留を減らせるかを切り分けます。
+MediaMTXは残したまま、推論クライアント側の `RTSP + FFmpeg` を WebRTC/WHEP 受信にした場合、FFmpegのprobeに伴う接続待ちや初期フレーム滞留を減らせるかを確認します。
 
-## 入力条件
+## 既存の性能検証実装を再利用する
 
-- 解像度: 1920x1080
-- 入力 FPS: 15fps
-- Codec: H.264
-- 入力元: Headless Chrome の fake camera
-- 配信: Browser から MediaMTX へ WebRTC
-- 同一フレームを識別できる `sourceFrameId` 相当のマーカーを映像内へ埋め込む
-- 1 回の workflow で 3 回比較する
+今回のA/B比較では、commercialization validationで物理フレーム追跡に使用した方式をそのまま基準にします。
+
+- 解像度: 1080x1920
+- 入力: 15fps / H.264
+- Browserはfake camera映像を専用HTMLからMediaMTXへWHIPでpublish
+- 映像内に16個の白黒ブロックを配置
+- 先頭4bitを同期パターン `1010`、後続12bitを `sourceFrameId` として使用
+- RTSP+FFmpeg側とWebRTC/WHEP側の双方で、受信映像そのものから同じ `sourceFrameId` を復号する
+
+送信側previewを画像解析してframe IDを推定する独自処理は使用しません。
+
+## live edge の基準
+
+A/Bの接続開始とは別に、MediaMTXへ事前接続したWebRTC/WHEP readerを1本維持します。
+
+```text
+                              ┌-- RTSP --> FFmpeg       ← A
+Browser --WHIP--> MediaMTX ---┼-- WHEP --> 新規Reader   ← B
+                              └-- WHEP --> 常時Reader   ← live edge基準
+```
+
+常時Readerで連続して復号した `sourceFrameId` を、その時点の最新映像に近い物理フレームの基準として使います。これはA/Bの起動時間には含めず、受信したフレームがどの程度古いかを判定するためだけに使用します。
+
+この検証では、受信フレームが常時Readerの `sourceFrameId` から2フレーム以内まで追いついた時点を「接続済み相当」とします。
 
 ## 比較する指標
 
 ### `first_frame_ms`
 
-Reader の接続開始から、最初に識別可能な映像フレームを取得するまでの時間です。
-
-単純な「最初に映像が来た速さ」を示しますが、そのフレームが現在時刻に近いとは限りません。
+Readerの接続開始から、最初に物理 `sourceFrameId` を復号できるまでの時間です。
 
 ### `first_frame_lag_ms_est`
 
-最初に取得したフレームが、同時刻の送信側フレームから何フレーム遅れているかを 15fps 基準で時間へ換算した推定値です。
-
-FFmpeg の probe 中に古いフレームが滞留している場合、この値が大きくなる可能性があります。
+最初に取得したフレームが、同時刻のlive edge基準から何フレーム遅れているかを15fpsで時間換算した推定値です。
 
 ### `ready_ms`
 
-接続開始から、受信フレームが送信側の最新フレームから 2 フレーム以内まで追いつくまでの時間です。
-
-この検証では単に decoder が開いた時点ではなく、**live edge に十分近づいた時点を「接続済み相当」**として扱います。
+接続開始から、受信映像がlive edge基準の2フレーム以内まで追いつくまでの時間です。今回の方式比較で最も重視する値です。
 
 ### `frames_before_ready`
 
-最初のフレーム取得後、live edge に追いつくまでに何フレーム処理したかを示します。
-
-古いフレームを順に消化してから追いつく方式では値が増えます。
+最初のフレーム取得後、live edgeへ追いつくまでに何フレーム処理したかを示します。古いフレームを順番に処理してから追いつく場合、この値が増えます。
 
 ### `post_ready_source_frame_steps`
 
-「接続済み相当」以降に 2fps として選択された物理フレーム ID の差分です。
+「接続済み相当」以降に2fpsとして選択された物理 `sourceFrameId` の差分です。
 
-15fps から 2fps へ変換する場合、期待される差分は概ね `7, 8, 7, 8 ...` です。
+15fpsから2fpsの場合、正常なサンプリングでは概ね `7, 8, 7, 8 ...` となります。
 
 ### `physical_sampling_ok`
 
-`post_ready_source_frame_steps` が 7 または 8 で推移し、接続済み以降の 2fps サンプリングに不自然な欠落・重複がないことを確認します。
+接続済み以降の物理フレームIDに重複がなく、2fpsの選択間隔が7または8フレームで推移することを確認します。
 
 ## 判定方針
 
-GitHub Actions の成功条件は、「A/B 両経路で測定可能なフレームを取得できたこと」です。
+GitHub Actionsのpass/failは、A/B両経路について物理フレームを取得し、live edgeまで追いついた状態で比較データを生成できたことを条件にします。
 
-WebRTC/WHEP が必ず RTSP+FFmpeg より速い、という条件は CI の pass/fail にはしません。方式選定は複数回の測定値を比較して判断します。
+WebRTC/WHEPが必ずRTSP+FFmpegより速いこと自体はCI成功条件にしません。方式選定は複数回の測定結果から判断します。
 
-特に重視するのは次の順です。
+確認順序は以下です。
 
 1. `ready_ms` が短いか
-2. 最初のフレームが live edge に近いか
-3. 接続済み以降の 2fps 物理フレームに欠落・重複がないか
-4. 結果が複数回で再現するか
+2. 最初のフレームがlive edgeに近いか
+3. 接続済み以降の2fps物理フレームに不自然な欠落・重複がないか
+4. 複数回で同じ傾向になるか
 
 ## 成果物
 
-workflow artifact に以下を保存します。
+workflow artifactに以下を保存します。
 
 ```text
 summary.json
+publisher_state.json
 repeat_1/
   metrics.json
-  publisher_events.json
+  reference_events.json
   rtsp_ffmpeg_events.json
   webrtc_whep_events.json
+  ffmpeg_command.json
   ffmpeg_stderr.log
+  candidate_video_meta.json
 repeat_2/
 ...
 mediamtx.log
 ```
 
-`summary.json` には方式ごとの median と各 repeat の結果を保存します。
-
 ## 注意点
 
-- GitHub-hosted runner 上の絶対レイテンシを、そのまま本番 PC の性能値として扱いません。
-- 同じ runner、同じ MediaMTX、同じ映像源での **方式間の相対差** を主に確認します。
-- 今回は推論モデルや Triton を通さず、映像受信方式そのものを切り分けます。
-- TURN 経由や実ネットワークでの揺らぎはこの検証範囲外です。
-- 本番方式を決める場合は、選定後に実環境で再度 E2E 性能を測定します。
+- GitHub-hosted runner上の絶対時間を、そのまま本番PCの性能値とは扱いません。
+- 同一runner・同一MediaMTX・同一映像源での方式間の相対差を主に確認します。
+- 常時WHEP Readerはlive edgeの物理フレーム基準であり、A/Bの性能比較対象ではありません。
+- 今回は推論モデルやTritonを通さず、映像受信方式そのものを切り分けます。
+- TURN経由や実ネットワークの揺らぎは検証範囲外です。
