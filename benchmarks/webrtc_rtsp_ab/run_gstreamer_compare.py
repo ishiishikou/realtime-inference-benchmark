@@ -15,13 +15,14 @@ from pathlib import Path
 from run_ab_compare import (
     BROWSER_DIR,
     Ev,
+    annotated,
     decode_marker,
     drain,
     driver,
     marker,
-    metrics,
     read_exact,
     ref_quality,
+    step,
     uniq,
     wait_marker,
     wait_path,
@@ -56,14 +57,17 @@ class GStreamerReceiver(threading.Thread):
             "!",
             "avdec_h264",
             "!",
+            "queue",
+            "max-size-buffers=1",
+            "max-size-bytes=0",
+            "max-size-time=0",
+            "leaky=downstream",
+            "!",
             "videoconvert",
             "!",
             "videoscale",
             "!",
-            "videorate",
-            "drop-only=true",
-            "!",
-            f"video/x-raw,format=BGR,width={width},height={height},framerate=2/1",
+            f"video/x-raw,format=BGR,width={width},height={height}",
             "!",
             "fdsink",
             "fd=1",
@@ -97,7 +101,7 @@ class GStreamerReceiver(threading.Thread):
             if frame_id is None:
                 self.failures += 1
             else:
-                self.outq.put(Ev(time.monotonic(), frame_id, "webrtc_gstreamer_2fps"))
+                self.outq.put(Ev(time.monotonic(), frame_id, "webrtc_gstreamer"))
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -112,6 +116,101 @@ class GStreamerReceiver(threading.Thread):
 
 def write_events(path: Path, events: list[Ev]) -> None:
     path.write_text(json.dumps([asdict(e) for e in events], indent=2) + "\n")
+
+
+def latest_2fps(events: list[Ev], ready_at: float) -> list[Ev]:
+    """Model the inference loop: every 500 ms consume the newest decoded frame."""
+    events = uniq(events)
+    selected: list[Ev] = []
+    for i in range(6):
+        target = ready_at + i * 0.5
+        candidates = [event for event in events if event.t <= target + 1e-9]
+        if not candidates:
+            continue
+        event = candidates[-1]
+        if not selected or event.frame_id != selected[-1].frame_id:
+            selected.append(event)
+    return selected
+
+
+def product_metrics(
+    t0: float,
+    events: list[Ev],
+    refs: list[Ev],
+    modulus: int,
+    fps: int,
+    failures: int,
+) -> dict:
+    """Ready = live-edge plus stable source cadence; startup burst is not monitored."""
+    rows = annotated(events, refs, modulus)
+    unique_events = uniq(events)
+    if not rows:
+        return {
+            "name": "webrtc_gstreamer",
+            "ok": False,
+            "reason": "no physical frames",
+            "marker_failures": failures,
+        }
+
+    first = rows[0]
+    base = {
+        "name": "webrtc_gstreamer",
+        "first_frame_ms": round((first["t"] - t0) * 1000, 3),
+        "first_frame_id": first["frame_id"],
+        "first_frame_lag_frames": first["lag_frames"],
+        "first_frame_lag_ms_est": round(first["lag_frames"] * 1000 / fps, 3),
+        "marker_failures": failures,
+        "event_count": len(unique_events),
+    }
+
+    # At 15 fps the nominal interval is 66.7 ms. Require four consecutive
+    # intervals in a deliberately broad 40-105 ms window and stay <=2 frames
+    # from the live-edge reference. This excludes the short startup burst.
+    ready_index = None
+    for index in range(4, len(rows)):
+        intervals = [
+            rows[pos]["t"] - rows[pos - 1]["t"]
+            for pos in range(index - 3, index + 1)
+        ]
+        recent = rows[index - 3 : index + 1]
+        cadence_stable = all(0.040 <= value <= 0.105 for value in intervals)
+        live_edge_stable = all(item["lag_frames"] <= 2 for item in recent)
+        if cadence_stable and live_edge_stable:
+            ready_index = index
+            break
+
+    if ready_index is None:
+        return {**base, "ok": False, "reason": "stable live edge not reached"}
+
+    ready = rows[ready_index]
+    ready_at = ready["t"]
+    selected = latest_2fps(unique_events, ready_at)
+    ids = [event.frame_id for event in selected]
+    steps = [step(a, b, modulus) for a, b in zip(ids, ids[1:])]
+    physical_sampling_ok = (
+        len(ids) >= 4
+        and len(ids) == len(set(ids))
+        and all(value in (7, 8) for value in steps)
+    )
+
+    full_ids = [event.frame_id for event in unique_events]
+    full_steps = [step(a, b, modulus) for a, b in zip(full_ids, full_ids[1:])]
+    full_rate_continuous = bool(full_steps) and max(full_steps) <= 2
+
+    return {
+        **base,
+        "ok": physical_sampling_ok and full_rate_continuous,
+        "ready_ms": round((ready_at - t0) * 1000, 3),
+        "ready_frame_id": ready["frame_id"],
+        "ready_reference_frame_id": ready["reference_frame_id"],
+        "ready_lag_frames": ready["lag_frames"],
+        "frames_before_ready": ready_index,
+        "post_ready_2fps_frame_ids": ids,
+        "post_ready_source_frame_steps": steps,
+        "physical_sampling_ok": physical_sampling_ok,
+        "full_rate_max_source_frame_step": max(full_steps) if full_steps else None,
+        "full_rate_continuous": full_rate_continuous,
+    }
 
 
 def run_once(
@@ -167,14 +266,12 @@ def run_once(
         **ref_quality(refs, modulus),
         "marker_failures": ref_failures,
     }
-    result = metrics(
-        "webrtc_gstreamer_2fps",
+    result = product_metrics(
         receiver.t0,
         frames,
         refs,
         modulus,
         fps,
-        True,
         receiver.failures,
     )
     measurement_valid = reference["usable"] and len(uniq(frames)) > 0
@@ -309,19 +406,22 @@ def main() -> int:
         for item in results
         if item["webrtc_gstreamer"].get("measurement_valid")
     ]
-    ready = [item for item in measured if item.get("ok") and "ready_ms" in item]
+    successful = [item for item in measured if item.get("ok")]
     aggregate = {
         "repeat_count": len(results),
         "measurement_valid_repeats": len(measured),
-        "ready_reached_repeats": len(ready),
+        "successful_repeats": len(successful),
         "first_frame_ms_median": median([x["first_frame_ms"] for x in measured]),
-        "first_frame_lag_ms_est_median": median(
-            [x["first_frame_lag_ms_est"] for x in measured]
+        "ready_ms_median": median([x["ready_ms"] for x in successful]),
+        "ready_lag_frames_median": median(
+            [float(x["ready_lag_frames"]) for x in successful]
         ),
-        "ready_ms_median": median([x["ready_ms"] for x in ready]),
-        "physical_sampling_ok_all_ready_repeats": bool(ready)
-        and all(x.get("physical_sampling_ok") for x in ready),
+        "physical_sampling_ok_all": bool(successful)
+        and all(x.get("physical_sampling_ok") for x in successful),
+        "full_rate_continuous_all": bool(successful)
+        and all(x.get("full_rate_continuous") for x in successful),
         "all_measurements_valid": len(measured) == args.repeats,
+        "all_repeats_successful": len(successful) == args.repeats,
     }
     summary = {
         "source": {
@@ -332,7 +432,11 @@ def main() -> int:
         },
         "path": (
             "Browser WHIP -> MediaMTX -> WebRTC/WHEP -> GStreamer whepsrc -> "
-            "rtph264depay -> avdec_h264 -> videorate 2fps"
+            "rtph264depay -> avdec_h264 -> leaky latest-frame queue -> inference-side 2fps"
+        ),
+        "ready_definition": (
+            "within 2 source frames of live edge and 4 consecutive 15fps intervals "
+            "between 40-105ms; frames before this boundary are startup-only"
         ),
         "live_edge_reference": "steady-state Chrome WHEP reader using the same physical sourceFrameId",
         "repeats": results,
@@ -342,7 +446,7 @@ def main() -> int:
         json.dumps(summary, indent=2) + "\n"
     )
     print(json.dumps(aggregate, indent=2))
-    return 0 if aggregate["all_measurements_valid"] else 2
+    return 0 if aggregate["all_repeats_successful"] else 2
 
 
 if __name__ == "__main__":
